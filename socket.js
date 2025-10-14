@@ -6,7 +6,7 @@ import http from "http";
 import { Server } from "socket.io";
 import bodyParser from "body-parser";
 import { ObjectId } from "mongodb";
-import dbConnect from "./db.js";
+import dbConnect from "./db.js"; // Assuming this is your DB connection utility
 
 const app = express();
 const PORT = process.env.PORT || 5000;
@@ -14,11 +14,15 @@ const PORT = process.env.PORT || 5000;
 const server = http.createServer(app);
 const io = new Server(server, {
     cors: { origin: "*" },
+    // **IMPORTANT:** Configure a ping interval/timeout for better stability
+    pingInterval: 25000,
+    pingTimeout: 60000,
 });
 
 app.use(bodyParser.json());
 
 if (!process.env.MONGO_URI) {
+    // This is good practice
     throw new Error("MONGO_URI must be defined in your .env file");
 }
 
@@ -32,6 +36,9 @@ async function fetchRecipientUnreadCount(chatId, recipientEmail) {
             { _id: new ObjectId(chatId) }
         );
 
+        // LOGGING
+        console.log(`[DB] Fetched chat ${chatId} for recipient ${recipientEmail}`);
+
         if (!chat) return { unreadCount: 0, lastMessagePreview: "Chat not found", lastMessageAt: new Date().toISOString() };
 
         const recipientParticipant = chat.participants?.find(p => p.email === recipientEmail);
@@ -44,15 +51,23 @@ async function fetchRecipientUnreadCount(chatId, recipientEmail) {
         };
 
     } catch (err) {
-        console.error("Failed to fetch unread count in socket server:", err.message);
+        console.error("[ERROR] Failed to fetch unread count in socket server:", err.message);
         return { unreadCount: 0, lastMessagePreview: "Error fetching preview", lastMessageAt: new Date().toISOString() };
     }
 }
 
+// -----------------------------------------------------
+// Primary HTTP POST Endpoint for Emitting Events
+// -----------------------------------------------------
+
 app.post("/api/socket/emit", async (req, res) => {
     const { chatId, action, data } = req.body;
 
+    // CRITICAL LOGGING: Check if the request is even reaching here
+    console.log(`[API_CALL] Received action: ${action} for chatId: ${chatId}`);
+
     if (!chatId || !action || !data) {
+        console.error("[API_ERROR] Missing required fields in API call.");
         return res.status(400).send({ error: "Missing required fields" });
     }
 
@@ -65,10 +80,15 @@ app.post("/api/socket/emit", async (req, res) => {
         const recipientEmail = savedMsg?.receiver?.email;
 
         if (!senderEmail || !recipientEmail) {
+            console.warn("[API_WARN] Missing sender or recipient email for newMessage.");
             return res.status(200).send({ success: true, warning: "Missing participant info" });
         }
 
+        // CRITICAL LOGGING: Confirming the emit is attempted
+        console.log(`[SOCKET_EMIT] Attempting to emit 'newMessage' to room: ${chatId}`);
         io.to(chatId).emit("newMessage", finalMsg);
+        console.log(`[SOCKET_EMIT] 'newMessage' emitted successfully.`);
+
 
         try {
             const chatsCollection = await dbConnect("chats");
@@ -77,14 +97,17 @@ app.post("/api/socket/emit", async (req, res) => {
                 { $inc: { "participants.$[recipient].unreadCount": 1 } },
                 { arrayFilters: [{ "recipient.email": recipientEmail }] }
             );
+            console.log(`[DB] Incremented unread count for recipient: ${recipientEmail}`);
 
         } catch (err) {
-            console.error("Failed to increment unreadCount in socket server:", err.message);
+            console.error("[DB_ERROR] Failed to increment unreadCount in socket server:", err.message);
         }
 
         const recipientSocketId = onlineUsers[recipientEmail];
 
+        // CRITICAL LOGGING: Check if the recipient is considered "online"
         if (recipientSocketId) {
+            console.log(`[STATUS] Recipient ${recipientEmail} is ONLINE. Socket ID: ${recipientSocketId}`);
 
             const updateData = await fetchRecipientUnreadCount(chatId, recipientEmail);
 
@@ -93,31 +116,45 @@ app.post("/api/socket/emit", async (req, res) => {
                 ...updateData,
                 lastMessageSenderEmail: senderEmail
             });
+            console.log(`[SOCKET_EMIT] Emitted 'conversationUpdate' to recipient: ${recipientEmail}`);
+        } else {
+            console.log(`[STATUS] Recipient ${recipientEmail} is OFFLINE. 'conversationUpdate' skipped.`);
         }
 
     } else if (action === "messageReact") {
         const { messageId, reactions } = data;
         io.to(chatId).emit("messageReact", chatId, messageId, reactions);
+        console.log(`[SOCKET_EMIT] Emitted 'messageReact' to room: ${chatId}`);
 
     } else if (action === "messageEdit") {
         const { messageId, newText } = data;
         io.to(chatId).emit("messageEdit", chatId, messageId, newText);
+        console.log(`[SOCKET_EMIT] Emitted 'messageEdit' to room: ${chatId}`);
 
     } else if (action === "messageDelete") {
         const { messageId, deletedBy } = data;
         io.to(chatId).emit("messageDelete", chatId, messageId, deletedBy);
+        console.log(`[SOCKET_EMIT] Emitted 'messageDelete' to room: ${chatId}`);
     } else {
+        console.error(`[API_ERROR] Unknown action received: ${action}`);
         return res.status(400).send({ error: `Unknown action: ${action}` });
     }
 
     return res.status(200).send({ success: true });
 });
 
+// -----------------------------------------------------
+// Socket.IO Connection Handlers
+// -----------------------------------------------------
+
 io.on("connection", (socket) => {
+    console.log(`[CONNECT] A user connected. Socket ID: ${socket.id}`);
 
     socket.on("userOnline", (email) => {
         if (!email) return;
         onlineUsers[email] = socket.id;
+        // CRITICAL LOGGING: Track online users
+        console.log(`[ONLINE] User online: ${email}. Total online: ${Object.keys(onlineUsers).length}`);
         io.emit("onlineUsersUpdate", Object.keys(onlineUsers));
     });
 
@@ -125,6 +162,8 @@ io.on("connection", (socket) => {
         const offlineEmail = Object.keys(onlineUsers).find(key => onlineUsers[key] === socket.id);
         if (offlineEmail) {
             delete onlineUsers[offlineEmail];
+            // CRITICAL LOGGING: Track disconnections
+            console.log(`[DISCONNECT] User offline: ${offlineEmail}. Total online: ${Object.keys(onlineUsers).length}`);
             io.emit("onlineUsersUpdate", Object.keys(onlineUsers));
         }
     });
@@ -132,16 +171,21 @@ io.on("connection", (socket) => {
     socket.on("joinChat", (chatId) => {
         if (!chatId) return;
         socket.join(chatId);
+        // CRITICAL LOGGING: Track room joins
+        console.log(`[ROOM] Socket ${socket.id} joined chat: ${chatId}`);
     });
 
     socket.on("leaveChat", (chatId) => {
         if (!chatId) return;
         socket.leave(chatId);
+        console.log(`[ROOM] Socket ${socket.id} left chat: ${chatId}`);
     });
 
+    // Typing works, so we just confirm its success
     socket.on("typing", (chatId, senderEmail) => {
         if (!chatId || !senderEmail) return;
         socket.to(chatId).emit("typing", chatId, senderEmail);
+        // console.log(`[EMIT_TYPING] ${senderEmail} is typing in ${chatId}`); // Can uncomment for verbose logging
     });
 
     socket.on("stopTyping", (chatId, senderEmail) => {
@@ -152,12 +196,14 @@ io.on("connection", (socket) => {
     socket.on("messageSeen", (chatId, messageId, viewerEmail) => {
         if (!chatId || !messageId || !viewerEmail) return;
         io.to(chatId).emit("messageSeenUpdate", chatId, messageId, viewerEmail);
+        console.log(`[SOCKET_EMIT] 'messageSeenUpdate' in ${chatId} by ${viewerEmail}`);
     });
 
     socket.on("conversationSeen", async (chatId, viewerEmail) => {
         if (!chatId || !viewerEmail) return;
 
         socket.to(chatId).emit("conversationSeen", chatId, viewerEmail);
+        console.log(`[SOCKET_EMIT] 'conversationSeen' in ${chatId} by ${viewerEmail}`);
 
         try {
             const chatsCollection = await dbConnect("chats");
@@ -166,9 +212,10 @@ io.on("connection", (socket) => {
                 { $set: { "participants.$[viewer].unreadCount": 0 } },
                 { arrayFilters: [{ "viewer.email": viewerEmail }] }
             );
+            console.log(`[DB] Reset unread count for viewer: ${viewerEmail}`);
 
         } catch (err) {
-            console.error("Failed to reset unreadCount on conversationSeen:", err.message);
+            console.error("[DB_ERROR] Failed to reset unreadCount on conversationSeen:", err.message);
         }
     });
 });
