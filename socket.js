@@ -6,20 +6,24 @@ import http from "http";
 import { Server } from "socket.io";
 import bodyParser from "body-parser";
 import { ObjectId } from "mongodb";
-import dbConnect from "./db.js"; // Assuming this connects to your Mongo DB
+// Assuming this connects to your Mongo DB, ensure it's robust
+import dbConnect from "./db.js";
 
 const app = express();
+const PORT = process.env.PORT || 5000; // Use the environment PORT or fallback to 5000
+
 const server = http.createServer(app);
 const io = new Server(server, {
-    cors: {
-        origin: "http://localhost:3000",
-        methods: ["GET", "POST"],
-    },
+    // Keep CORS permissive for deployment, but restrict it in final production
+    cors: { origin: "*" },
+    // Add transports option as a best practice for stability in some cloud environments
+    transports: ['websocket', 'polling'],
 });
 
 app.use(bodyParser.json());
 
 if (!process.env.MONGO_URI) {
+    // It's good practice to exit if a critical environment variable is missing
     throw new Error("MONGO_URI must be defined in your .env file");
 }
 
@@ -70,8 +74,7 @@ app.post("/api/socket/emit", async (req, res) => {
     if (action === "newMessage") {
         const { savedMsg, optimisticId } = data;
 
-        // ⭐ CRITICAL FIX: Ensure the payload for the socket includes the optimisticId
-        // so the sender's frontend can replace the temporary message.
+        // Ensure the payload for the socket includes the optimisticId
         const finalMsg = { ...savedMsg, optimisticId };
 
         const senderEmail = savedMsg?.sender?.email;
@@ -183,11 +186,8 @@ io.on("connection", (socket) => {
     });
 
     // ------------------- Message Seen -------------------
-    // This is for individual message read receipts (the tick marks)
     socket.on("messageSeen", (chatId, messageId, viewerEmail) => {
         if (!chatId || !messageId || !viewerEmail) return;
-
-        // ONLY EMIT THE REAL-TIME EVENT for the sender's read receipt
         io.to(chatId).emit("messageSeenUpdate", chatId, messageId, viewerEmail);
     });
 
@@ -213,9 +213,11 @@ io.on("connection", (socket) => {
     });
 });
 
-server.listen(3001, () => console.log("✅ Socket server running on port 3001"));
+// ------------------- CRITICAL FIX APPLIED HERE -------------------
+server.listen(PORT, () => console.log(`✅ Socket server running on port ${PORT}`));
+// -----------------------------------------------------------------
 
 // Root route to verify server is running
 app.get("/", (req, res) => {
-    res.send("✅ Socket server is running on port 3001");
+    res.send("✅ Socket server is running and listening on the correct port.");
 });
