@@ -6,27 +6,27 @@ import http from "http";
 import { Server } from "socket.io";
 import bodyParser from "body-parser";
 import { ObjectId } from "mongodb";
-import dbConnect from "./db.js"; // Assuming this is your DB connection utility
+import dbConnect from "./db.js"; // Your DB connection utility
 
 const app = express();
 const PORT = process.env.PORT || 5000;
 
 const server = http.createServer(app);
 const io = new Server(server, {
-    cors: { origin: "*" },
-    // **IMPORTANT:** Configure a ping interval/timeout for better stability
-    pingInterval: 25000,
+    cors: { origin: "*" }, // Allows all origins for CORS
+    pingInterval: 25000, 
     pingTimeout: 60000,
 });
 
 app.use(bodyParser.json());
 
 if (!process.env.MONGO_URI) {
-    // This is good practice
     throw new Error("MONGO_URI must be defined in your .env file");
 }
 
 let onlineUsers = {};
+
+// ... (fetchRecipientUnreadCount function remains the same) ...
 
 async function fetchRecipientUnreadCount(chatId, recipientEmail) {
     try {
@@ -35,8 +35,7 @@ async function fetchRecipientUnreadCount(chatId, recipientEmail) {
         const chat = await chatsCollection.findOne(
             { _id: new ObjectId(chatId) }
         );
-
-        // LOGGING
+        
         console.log(`[DB] Fetched chat ${chatId} for recipient ${recipientEmail}`);
 
         if (!chat) return { unreadCount: 0, lastMessagePreview: "Chat not found", lastMessageAt: new Date().toISOString() };
@@ -63,7 +62,7 @@ async function fetchRecipientUnreadCount(chatId, recipientEmail) {
 app.post("/api/socket/emit", async (req, res) => {
     const { chatId, action, data } = req.body;
 
-    // CRITICAL LOGGING: Check if the request is even reaching here
+    // CRITICAL LOGGING: If this appears in Render logs, your client HTTP POST is working.
     console.log(`[API_CALL] Received action: ${action} for chatId: ${chatId}`);
 
     if (!chatId || !action || !data) {
@@ -84,7 +83,7 @@ app.post("/api/socket/emit", async (req, res) => {
             return res.status(200).send({ success: true, warning: "Missing participant info" });
         }
 
-        // CRITICAL LOGGING: Confirming the emit is attempted
+        // CRITICAL: The message is emitted to the room.
         console.log(`[SOCKET_EMIT] Attempting to emit 'newMessage' to room: ${chatId}`);
         io.to(chatId).emit("newMessage", finalMsg);
         console.log(`[SOCKET_EMIT] 'newMessage' emitted successfully.`);
@@ -104,8 +103,7 @@ app.post("/api/socket/emit", async (req, res) => {
         }
 
         const recipientSocketId = onlineUsers[recipientEmail];
-
-        // CRITICAL LOGGING: Check if the recipient is considered "online"
+        
         if (recipientSocketId) {
             console.log(`[STATUS] Recipient ${recipientEmail} is ONLINE. Socket ID: ${recipientSocketId}`);
 
@@ -153,7 +151,6 @@ io.on("connection", (socket) => {
     socket.on("userOnline", (email) => {
         if (!email) return;
         onlineUsers[email] = socket.id;
-        // CRITICAL LOGGING: Track online users
         console.log(`[ONLINE] User online: ${email}. Total online: ${Object.keys(onlineUsers).length}`);
         io.emit("onlineUsersUpdate", Object.keys(onlineUsers));
     });
@@ -162,7 +159,6 @@ io.on("connection", (socket) => {
         const offlineEmail = Object.keys(onlineUsers).find(key => onlineUsers[key] === socket.id);
         if (offlineEmail) {
             delete onlineUsers[offlineEmail];
-            // CRITICAL LOGGING: Track disconnections
             console.log(`[DISCONNECT] User offline: ${offlineEmail}. Total online: ${Object.keys(onlineUsers).length}`);
             io.emit("onlineUsersUpdate", Object.keys(onlineUsers));
         }
@@ -181,11 +177,11 @@ io.on("connection", (socket) => {
         console.log(`[ROOM] Socket ${socket.id} left chat: ${chatId}`);
     });
 
-    // Typing works, so we just confirm its success
+    // ... (All other event handlers remain the same) ...
+
     socket.on("typing", (chatId, senderEmail) => {
         if (!chatId || !senderEmail) return;
         socket.to(chatId).emit("typing", chatId, senderEmail);
-        // console.log(`[EMIT_TYPING] ${senderEmail} is typing in ${chatId}`); // Can uncomment for verbose logging
     });
 
     socket.on("stopTyping", (chatId, senderEmail) => {
