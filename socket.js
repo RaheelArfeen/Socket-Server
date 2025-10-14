@@ -6,37 +6,24 @@ import http from "http";
 import { Server } from "socket.io";
 import bodyParser from "body-parser";
 import { ObjectId } from "mongodb";
-// Assuming this connects to your Mongo DB, ensure it's robust
 import dbConnect from "./db.js";
 
 const app = express();
-const PORT = process.env.PORT || 5000; // Use the environment PORT or fallback to 5000
+const PORT = process.env.PORT || 5000;
 
 const server = http.createServer(app);
 const io = new Server(server, {
-    // Keep CORS permissive for deployment, but restrict it in final production
     cors: { origin: "*" },
-    // Add transports option as a best practice for stability in some cloud environments
-    transports: ['websocket', 'polling'],
 });
 
 app.use(bodyParser.json());
 
 if (!process.env.MONGO_URI) {
-    // It's good practice to exit if a critical environment variable is missing
     throw new Error("MONGO_URI must be defined in your .env file");
 }
 
 let onlineUsers = {};
 
-// ------------------- Helper Function -------------------
-
-/**
- * Fetches the recipient's current unread count and the last message preview for a chat.
- * @param {string} chatId - The ID of the chat.
- * @param {string} recipientEmail - The email of the recipient participant.
- * @returns {Promise<{unreadCount: number, lastMessagePreview: string, lastMessageAt: string}>}
- */
 async function fetchRecipientUnreadCount(chatId, recipientEmail) {
     try {
         const chatsCollection = await dbConnect("chats");
@@ -62,8 +49,6 @@ async function fetchRecipientUnreadCount(chatId, recipientEmail) {
     }
 }
 
-
-// ------------------- API to push saved messages/events -------------------
 app.post("/api/socket/emit", async (req, res) => {
     const { chatId, action, data } = req.body;
 
@@ -74,23 +59,17 @@ app.post("/api/socket/emit", async (req, res) => {
     if (action === "newMessage") {
         const { savedMsg, optimisticId } = data;
 
-        // Ensure the payload for the socket includes the optimisticId
         const finalMsg = { ...savedMsg, optimisticId };
 
         const senderEmail = savedMsg?.sender?.email;
         const recipientEmail = savedMsg?.receiver?.email;
 
         if (!senderEmail || !recipientEmail) {
-            console.warn(`[WARN] Missing sender/receiver data in newMessage for chat ${chatId}`);
             return res.status(200).send({ success: true, warning: "Missing participant info" });
         }
 
-        // 1. Emit the new message to the chat room (for users currently viewing the chat)
         io.to(chatId).emit("newMessage", finalMsg);
-        console.log(`[API_PUSH] New Message emitted to room ${chatId} from ${senderEmail}`);
 
-
-        // 2. Increment the recipient's unreadCount by 1 in the DB
         try {
             const chatsCollection = await dbConnect("chats");
             await chatsCollection.updateOne(
@@ -103,23 +82,17 @@ app.post("/api/socket/emit", async (req, res) => {
             console.error("Failed to increment unreadCount in socket server:", err.message);
         }
 
-
-        // 3. Check if recipient is online
         const recipientSocketId = onlineUsers[recipientEmail];
 
         if (recipientSocketId) {
 
-            // 4. Fetch the new conversation list update data
             const updateData = await fetchRecipientUnreadCount(chatId, recipientEmail);
 
-            // 5. Emit a dedicated event to the recipient's socket for conversation list update
             io.to(recipientSocketId).emit("conversationUpdate", {
                 chatId,
                 ...updateData,
                 lastMessageSenderEmail: senderEmail
             });
-            console.log(`[PUSH_CONV] Emitted update to recipient ${recipientEmail} for chat ${chatId}`);
-
         }
 
     } else if (action === "messageReact") {
@@ -140,16 +113,12 @@ app.post("/api/socket/emit", async (req, res) => {
     return res.status(200).send({ success: true });
 });
 
-// ------------------- Socket.io Events -------------------
 io.on("connection", (socket) => {
-    console.log("[SOCKET] User connected:", socket.id);
 
-    // Track online users
     socket.on("userOnline", (email) => {
         if (!email) return;
         onlineUsers[email] = socket.id;
         io.emit("onlineUsersUpdate", Object.keys(onlineUsers));
-        console.log(`[STATUS] User ${email} is online.`);
     });
 
     socket.on("disconnect", () => {
@@ -158,23 +127,18 @@ io.on("connection", (socket) => {
             delete onlineUsers[offlineEmail];
             io.emit("onlineUsersUpdate", Object.keys(onlineUsers));
         }
-        console.log("[SOCKET] User disconnected:", socket.id);
     });
 
-    // Room management
     socket.on("joinChat", (chatId) => {
         if (!chatId) return;
         socket.join(chatId);
-        console.log(`[ROOM] ${socket.id} joined room: ${chatId}`);
     });
 
     socket.on("leaveChat", (chatId) => {
         if (!chatId) return;
         socket.leave(chatId);
-        console.log(`[ROOM] ${socket.id} left room: ${chatId}`);
     });
 
-    // Typing indicators
     socket.on("typing", (chatId, senderEmail) => {
         if (!chatId || !senderEmail) return;
         socket.to(chatId).emit("typing", chatId, senderEmail);
@@ -185,20 +149,16 @@ io.on("connection", (socket) => {
         socket.to(chatId).emit("stopTyping", chatId, senderEmail);
     });
 
-    // ------------------- Message Seen -------------------
     socket.on("messageSeen", (chatId, messageId, viewerEmail) => {
         if (!chatId || !messageId || !viewerEmail) return;
         io.to(chatId).emit("messageSeenUpdate", chatId, messageId, viewerEmail);
     });
 
-    // ------------------- Conversation Seen (Mark all as read) -------------------
     socket.on("conversationSeen", async (chatId, viewerEmail) => {
         if (!chatId || !viewerEmail) return;
 
-        // 1. Emit to the sender (who is in the same room) to mark all their sent messages as seen
         socket.to(chatId).emit("conversationSeen", chatId, viewerEmail);
 
-        // 2. Reset unreadCount on the backend immediately
         try {
             const chatsCollection = await dbConnect("chats");
             await chatsCollection.updateOne(
@@ -213,11 +173,8 @@ io.on("connection", (socket) => {
     });
 });
 
-// ------------------- CRITICAL FIX APPLIED HERE -------------------
 server.listen(PORT, () => console.log(`✅ Socket server running on port ${PORT}`));
-// -----------------------------------------------------------------
 
-// Root route to verify server is running
 app.get("/", (req, res) => {
     res.send("✅ Socket server is running and listening on the correct port.");
 });
