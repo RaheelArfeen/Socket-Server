@@ -6,7 +6,7 @@ import http from "http";
 import { Server } from "socket.io";
 import bodyParser from "body-parser";
 import { ObjectId } from "mongodb";
-import dbConnect from "./db.js";
+import dbConnect from "./db.js"; // Assuming this connects to your Mongo DB
 
 const app = express();
 const server = http.createServer(app);
@@ -25,6 +25,8 @@ if (!process.env.MONGO_URI) {
 
 let onlineUsers = {};
 
+// ------------------- Helper Function -------------------
+
 /**
  * Fetches the recipient's current unread count and the last message preview for a chat.
  * @param {string} chatId - The ID of the chat.
@@ -35,17 +37,13 @@ async function fetchRecipientUnreadCount(chatId, recipientEmail) {
     try {
         const chatsCollection = await dbConnect("chats");
 
-        // Find chat by ID
         const chat = await chatsCollection.findOne(
             { _id: new ObjectId(chatId) }
         );
 
         if (!chat) return { unreadCount: 0, lastMessagePreview: "Chat not found", lastMessageAt: new Date().toISOString() };
 
-        // Find recipient participant data
         const recipientParticipant = chat.participants?.find(p => p.email === recipientEmail);
-
-        // Get the actual last message from the messages array
         const lastMessage = chat.messages?.[chat.messages.length - 1];
 
         return {
@@ -71,10 +69,10 @@ app.post("/api/socket/emit", async (req, res) => {
 
     if (action === "newMessage") {
         const { savedMsg, optimisticId } = data;
-        const finalMsg = { ...savedMsg, optimisticId };
 
-        // 1. Emit the new message to the chat room (for users currently viewing the chat)
-        io.to(chatId).emit("newMessage", finalMsg);
+        // ⭐ CRITICAL FIX: Ensure the payload for the socket includes the optimisticId
+        // so the sender's frontend can replace the temporary message.
+        const finalMsg = { ...savedMsg, optimisticId };
 
         const senderEmail = savedMsg?.sender?.email;
         const recipientEmail = savedMsg?.receiver?.email;
@@ -84,34 +82,34 @@ app.post("/api/socket/emit", async (req, res) => {
             return res.status(200).send({ success: true, warning: "Missing participant info" });
         }
 
-        console.log(`[API_PUSH] New Message sent to room ${chatId} from ${senderEmail}`);
+        // 1. Emit the new message to the chat room (for users currently viewing the chat)
+        io.to(chatId).emit("newMessage", finalMsg);
+        console.log(`[API_PUSH] New Message emitted to room ${chatId} from ${senderEmail}`);
 
-        // 🔥 CRITICAL UPDATE FOR RED DOT STATUS (UNREAD COUNT)
+
+        // 2. Increment the recipient's unreadCount by 1 in the DB
         try {
             const chatsCollection = await dbConnect("chats");
-
-            // Optimistically increment the recipient's unreadCount by 1 in the DB
             await chatsCollection.updateOne(
                 { _id: new ObjectId(chatId), "participants.email": recipientEmail },
                 { $inc: { "participants.$[recipient].unreadCount": 1 } },
                 { arrayFilters: [{ "recipient.email": recipientEmail }] }
             );
-            console.log(`[DB_UPDATE] Incremented unreadCount for ${recipientEmail} in chat ${chatId}`);
 
         } catch (err) {
             console.error("Failed to increment unreadCount in socket server:", err.message);
         }
-        // 🔥 END CRITICAL UPDATE
 
-        // 2. Check if recipient is online (but not necessarily in the chat room)
+
+        // 3. Check if recipient is online
         const recipientSocketId = onlineUsers[recipientEmail];
 
         if (recipientSocketId) {
 
-            // 3. Fetch the new unread count (which is now updated in the DB) and last message preview
+            // 4. Fetch the new conversation list update data
             const updateData = await fetchRecipientUnreadCount(chatId, recipientEmail);
 
-            // 4. Emit a dedicated event to the recipient's socket for conversation list update
+            // 5. Emit a dedicated event to the recipient's socket for conversation list update
             io.to(recipientSocketId).emit("conversationUpdate", {
                 chatId,
                 ...updateData,
@@ -124,18 +122,14 @@ app.post("/api/socket/emit", async (req, res) => {
     } else if (action === "messageReact") {
         const { messageId, reactions } = data;
         io.to(chatId).emit("messageReact", chatId, messageId, reactions);
-        console.log(`[API_PUSH] Message reacted in room ${chatId} on ${messageId}`);
 
     } else if (action === "messageEdit") {
         const { messageId, newText } = data;
         io.to(chatId).emit("messageEdit", chatId, messageId, newText);
-        console.log(`[API_PUSH] Message edited in room ${chatId} on ${messageId}`);
 
     } else if (action === "messageDelete") {
         const { messageId, deletedBy } = data;
         io.to(chatId).emit("messageDelete", chatId, messageId, deletedBy);
-        console.log(`[API_PUSH] Message deleted in room ${chatId} on ${messageId}`);
-
     } else {
         return res.status(400).send({ error: `Unknown action: ${action}` });
     }
@@ -160,17 +154,13 @@ io.on("connection", (socket) => {
         if (offlineEmail) {
             delete onlineUsers[offlineEmail];
             io.emit("onlineUsersUpdate", Object.keys(onlineUsers));
-            console.log(`[STATUS] User ${offlineEmail} went offline.`);
         }
         console.log("[SOCKET] User disconnected:", socket.id);
     });
 
-    // Join chat room
-    socket.on("joinChat", async (chatId, lastMessageId = null) => {
-        if (!chatId) {
-            console.warn("[WARN] joinChat called with invalid chatId:", chatId);
-            return;
-        }
+    // Room management
+    socket.on("joinChat", (chatId) => {
+        if (!chatId) return;
         socket.join(chatId);
         console.log(`[ROOM] ${socket.id} joined room: ${chatId}`);
     });
@@ -193,63 +183,29 @@ io.on("connection", (socket) => {
     });
 
     // ------------------- Message Seen -------------------
-    socket.on("messageSeen", async (chatId, messageId, viewerEmail) => {
-        if (!chatId || !messageId || !viewerEmail) {
-            console.warn("[WARN] Invalid messageSeen payload:", { chatId, messageId, viewerEmail });
-            return;
-        }
+    // This is for individual message read receipts (the tick marks)
+    socket.on("messageSeen", (chatId, messageId, viewerEmail) => {
+        if (!chatId || !messageId || !viewerEmail) return;
 
+        // ONLY EMIT THE REAL-TIME EVENT for the sender's read receipt
         io.to(chatId).emit("messageSeenUpdate", chatId, messageId, viewerEmail);
-        console.log(`[SEEN] Message ${messageId} seen in room ${chatId} by ${viewerEmail}`);
-
-        // Fallback DB update (in case frontend PATCH fails or for safety)
-        try {
-            const chatsCollection = await dbConnect("chats");
-
-            if (!ObjectId.isValid(chatId) || !ObjectId.isValid(messageId)) {
-                console.warn("[WARN] Invalid ObjectId detected:", { chatId, messageId });
-                return;
-            }
-
-            // 1. Mark individual message as seen
-            await chatsCollection.updateOne(
-                { _id: new ObjectId(chatId) },
-                { $set: { "messages.$[msg].isSeen": true } },
-                { arrayFilters: [{ "msg._id": new ObjectId(messageId) }] }
-            );
-
-            // 2. Reset the viewer's unreadCount to 0 (since they explicitly marked a message seen)
-            await chatsCollection.updateOne(
-                { _id: new ObjectId(chatId), "participants.email": viewerEmail },
-                { $set: { "participants.$[viewer].unreadCount": 0 } },
-                { arrayFilters: [{ "viewer.email": viewerEmail }] }
-            );
-
-        } catch (err) {
-            console.error("Failed to update isSeen in DB (socket fallback):", err.message);
-        }
     });
 
-    // ------------------- Conversation Seen -------------------
+    // ------------------- Conversation Seen (Mark all as read) -------------------
     socket.on("conversationSeen", async (chatId, viewerEmail) => {
         if (!chatId || !viewerEmail) return;
 
-        // Emit to the sender (who is in the same room)
+        // 1. Emit to the sender (who is in the same room) to mark all their sent messages as seen
         socket.to(chatId).emit("conversationSeen", chatId, viewerEmail);
-        console.log(`[CONV_SEEN] All messages in ${chatId} seen by ${viewerEmail}`);
 
-        // Reset unreadCount on the backend immediately
+        // 2. Reset unreadCount on the backend immediately
         try {
             const chatsCollection = await dbConnect("chats");
-            const resetUnreadResult = await chatsCollection.updateOne(
+            await chatsCollection.updateOne(
                 { _id: new ObjectId(chatId), "participants.email": viewerEmail },
                 { $set: { "participants.$[viewer].unreadCount": 0 } },
                 { arrayFilters: [{ "viewer.email": viewerEmail }] }
             );
-
-            if (resetUnreadResult.modifiedCount > 0) {
-                console.log(`[DB] Unread count reset for ${viewerEmail} in chat ${chatId}`);
-            }
 
         } catch (err) {
             console.error("Failed to reset unreadCount on conversationSeen:", err.message);
@@ -258,3 +214,8 @@ io.on("connection", (socket) => {
 });
 
 server.listen(3001, () => console.log("✅ Socket server running on port 3001"));
+
+// Root route to verify server is running
+app.get("/", (req, res) => {
+    res.send("✅ Socket server is running on port 3001");
+});
