@@ -67,60 +67,68 @@ app.post("/api/socket/emit", async (req, res) => {
         return res.status(400).send({ error: "Missing required fields" });
     }
 
-    if (action === "newMessage") {
-        const { savedMsg, optimisticId } = data;
+    console.log(`📩 /api/socket/emit -> Action: ${action}, Chat ID: ${chatId}`);
 
-        const finalMsg = { ...savedMsg, optimisticId };
+    try {
+        if (action === "newMessage") {
+            const { savedMsg, optimisticId } = data;
+            const finalMsg = { ...savedMsg, optimisticId };
 
-        const senderEmail = savedMsg?.sender?.email;
-        const recipientEmail = savedMsg?.receiver?.email;
+            console.log("💬 Emitting newMessage event:", finalMsg);
 
-        if (!senderEmail || !recipientEmail) {
-            return res.status(200).send({ success: true, warning: "Missing participant info" });
+            io.to(chatId).emit("messageReceived", finalMsg); // ✅ unified event name
+
+            // increment unread count for recipient
+            const senderEmail = savedMsg?.sender?.email;
+            const recipientEmail = savedMsg?.receiver?.email;
+
+            if (recipientEmail) {
+                const chatsCollection = await dbConnect("chats");
+                await chatsCollection.updateOne(
+                    { _id: new ObjectId(chatId), "participants.email": recipientEmail },
+                    { $inc: { "participants.$[recipient].unreadCount": 1 } },
+                    { arrayFilters: [{ "recipient.email": recipientEmail }] }
+                );
+
+                const recipientSocketId = onlineUsers[recipientEmail];
+                if (recipientSocketId) {
+                    const updateData = await fetchRecipientUnreadCount(chatId, recipientEmail);
+                    io.to(recipientSocketId).emit("conversationUpdate", {
+                        chatId,
+                        ...updateData,
+                        lastMessageSenderEmail: senderEmail
+                    });
+                }
+            }
         }
 
-        io.to(chatId).emit("newMessage", finalMsg);
-
-        try {
-            const chatsCollection = await dbConnect("chats");
-            await chatsCollection.updateOne(
-                { _id: new ObjectId(chatId), "participants.email": recipientEmail },
-                { $inc: { "participants.$[recipient].unreadCount": 1 } },
-                { arrayFilters: [{ "recipient.email": recipientEmail }] }
-            );
-
-        } catch (err) {
-            console.error("[DB_ERROR] Failed to increment unreadCount in socket server:", err.message);
+        else if (action === "messageReact") {
+            const { messageId, reactions } = data;
+            console.log("❤️ Emitting messageReact:", { chatId, messageId });
+            io.to(chatId).emit("messageReacted", { chatId, messageId, reactions }); // ✅ unified event name
         }
 
-        const recipientSocketId = onlineUsers[recipientEmail];
-
-        if (recipientSocketId) {
-            const updateData = await fetchRecipientUnreadCount(chatId, recipientEmail);
-
-            io.to(recipientSocketId).emit("conversationUpdate", {
-                chatId,
-                ...updateData,
-                lastMessageSenderEmail: senderEmail
-            });
+        else if (action === "messageEdit") {
+            const { messageId, newText } = data;
+            console.log("✏️ Emitting messageEdit:", { chatId, messageId });
+            io.to(chatId).emit("messageUpdated", { chatId, messageId, newText }); // ✅ unified event name
         }
 
-    } else if (action === "messageReact") {
-        const { messageId, reactions } = data;
-        io.to(chatId).emit("messageReact", chatId, messageId, reactions);
+        else if (action === "messageDelete") {
+            const { messageId, deletedBy } = data;
+            console.log("🗑️ Emitting messageDelete:", { chatId, messageId });
+            io.to(chatId).emit("messageDeleted", { chatId, messageId, deletedBy }); // ✅ unified event name
+        }
 
-    } else if (action === "messageEdit") {
-        const { messageId, newText } = data;
-        io.to(chatId).emit("messageEdit", chatId, messageId, newText);
+        else {
+            return res.status(400).send({ error: `Unknown action: ${action}` });
+        }
 
-    } else if (action === "messageDelete") {
-        const { messageId, deletedBy } = data;
-        io.to(chatId).emit("messageDelete", chatId, messageId, deletedBy);
-    } else {
-        return res.status(400).send({ error: `Unknown action: ${action}` });
+        res.status(200).send({ success: true });
+    } catch (err) {
+        console.error("❌ Socket emit route error:", err.message);
+        res.status(500).send({ error: err.message });
     }
-
-    return res.status(200).send({ success: true });
 });
 
 io.on("connection", (socket) => {
