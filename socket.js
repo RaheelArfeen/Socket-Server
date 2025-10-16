@@ -16,12 +16,9 @@ const server = http.createServer(app);
 
 const io = new Server(server, {
     cors: {
-        origin: [
-            "http://localhost:3000",
-            "https://mecha-link.vercel.app"
-        ],
+        origin: ["https://mecha-link.vercel.app"],
         methods: ["GET", "POST"],
-        credentials: true
+        credentials: true,
     },
     pingInterval: 25000,
     pingTimeout: 60000,
@@ -190,7 +187,9 @@ io.on("connection", (socket) => {
     });
 });
 
-server.listen(PORT, () => console.log(`✅ Socket server running on port ${PORT}`));
+server.listen(PORT, "0.0.0.0", () =>
+    console.log(`✅ Socket server running on port ${PORT}`)
+);
 
 app.get("/", (req, res) => {
     res.send(`✅ Socket server is running and listening on port ${PORT}.`);
