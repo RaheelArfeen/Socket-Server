@@ -8,18 +8,12 @@ import bodyParser from "body-parser";
 import { ObjectId } from "mongodb";
 import dbConnect from "./db.js";
 
-const FALLBACK_PORT = 3001;
-const PORT = process.env.PORT || FALLBACK_PORT;
-
 const app = express();
-const server = http.createServer(app);
+const PORT = process.env.PORT || 3001;
 
+const server = http.createServer(app);
 const io = new Server(server, {
-    cors: {
-        origin: ["https://mecha-link.vercel.app"],
-        methods: ["GET", "POST"],
-        credentials: true,
-    },
+    cors: { origin: "*" },
     pingInterval: 25000,
     pingTimeout: 60000,
 });
@@ -27,7 +21,7 @@ const io = new Server(server, {
 app.use(bodyParser.json());
 
 if (!process.env.MONGO_URI) {
-    throw new Error("MONGO_URI must be defined in your .env file or environment variables");
+    throw new Error("MONGO_URI must be defined in your .env file");
 }
 
 let onlineUsers = {};
@@ -39,6 +33,8 @@ async function fetchRecipientUnreadCount(chatId, recipientEmail) {
         const chat = await chatsCollection.findOne(
             { _id: new ObjectId(chatId) }
         );
+
+        console.log(`[DB] Fetched chat ${chatId} for recipient ${recipientEmail}`);
 
         if (!chat) return { unreadCount: 0, lastMessagePreview: "Chat not found", lastMessageAt: new Date().toISOString() };
 
@@ -57,81 +53,101 @@ async function fetchRecipientUnreadCount(chatId, recipientEmail) {
     }
 }
 
+// -----------------------------------------------------
+// Primary HTTP POST Endpoint for Emitting Events
+// -----------------------------------------------------
+
 app.post("/api/socket/emit", async (req, res) => {
     const { chatId, action, data } = req.body;
 
+    console.log(`[API_CALL] Received action: ${action} for chatId: ${chatId}`);
+
     if (!chatId || !action || !data) {
+        console.error("[API_ERROR] Missing required fields in API call.");
         return res.status(400).send({ error: "Missing required fields" });
     }
 
-    console.log(`📩 /api/socket/emit -> Action: ${action}, Chat ID: ${chatId}`);
+    if (action === "newMessage") {
+        const { savedMsg, optimisticId } = data;
 
-    try {
-        if (action === "newMessage") {
-            const { savedMsg, optimisticId } = data;
-            const finalMsg = { ...savedMsg, optimisticId };
+        const finalMsg = { ...savedMsg, optimisticId };
 
-            console.log("💬 Emitting newMessage event:", finalMsg);
+        const senderEmail = savedMsg?.sender?.email;
+        const recipientEmail = savedMsg?.receiver?.email;
 
-            io.to(chatId).emit("messageReceived", finalMsg); // ✅ unified event name
-
-            // increment unread count for recipient
-            const senderEmail = savedMsg?.sender?.email;
-            const recipientEmail = savedMsg?.receiver?.email;
-
-            if (recipientEmail) {
-                const chatsCollection = await dbConnect("chats");
-                await chatsCollection.updateOne(
-                    { _id: new ObjectId(chatId), "participants.email": recipientEmail },
-                    { $inc: { "participants.$[recipient].unreadCount": 1 } },
-                    { arrayFilters: [{ "recipient.email": recipientEmail }] }
-                );
-
-                const recipientSocketId = onlineUsers[recipientEmail];
-                if (recipientSocketId) {
-                    const updateData = await fetchRecipientUnreadCount(chatId, recipientEmail);
-                    io.to(recipientSocketId).emit("conversationUpdate", {
-                        chatId,
-                        ...updateData,
-                        lastMessageSenderEmail: senderEmail
-                    });
-                }
-            }
+        if (!senderEmail || !recipientEmail) {
+            console.warn("[API_WARN] Missing sender or recipient email for newMessage.");
+            return res.status(200).send({ success: true, warning: "Missing participant info" });
         }
 
-        else if (action === "messageReact") {
-            const { messageId, reactions } = data;
-            console.log("❤️ Emitting messageReact:", { chatId, messageId });
-            io.to(chatId).emit("messageReacted", { chatId, messageId, reactions }); // ✅ unified event name
+        console.log(`[SOCKET_EMIT] Attempting to emit 'newMessage' to room: ${chatId}`);
+        io.to(chatId).emit("newMessage", finalMsg);
+        console.log(`[SOCKET_EMIT] 'newMessage' emitted successfully.`);
+
+
+        try {
+            const chatsCollection = await dbConnect("chats");
+            await chatsCollection.updateOne(
+                { _id: new ObjectId(chatId), "participants.email": recipientEmail },
+                { $inc: { "participants.$[recipient].unreadCount": 1 } },
+                { arrayFilters: [{ "recipient.email": recipientEmail }] }
+            );
+            console.log(`[DB] Incremented unread count for recipient: ${recipientEmail}`);
+
+        } catch (err) {
+            console.error("[DB_ERROR] Failed to increment unreadCount in socket server:", err.message);
         }
 
-        else if (action === "messageEdit") {
-            const { messageId, newText } = data;
-            console.log("✏️ Emitting messageEdit:", { chatId, messageId });
-            io.to(chatId).emit("messageUpdated", { chatId, messageId, newText }); // ✅ unified event name
+        const recipientSocketId = onlineUsers[recipientEmail];
+
+        if (recipientSocketId) {
+            console.log(`[STATUS] Recipient ${recipientEmail} is ONLINE. Socket ID: ${recipientSocketId}`);
+
+            const updateData = await fetchRecipientUnreadCount(chatId, recipientEmail);
+
+            io.to(recipientSocketId).emit("conversationUpdate", {
+                chatId,
+                ...updateData,
+                lastMessageSenderEmail: senderEmail
+            });
+            console.log(`[SOCKET_EMIT] Emitted 'conversationUpdate' to recipient: ${recipientEmail}`);
+        } else {
+            console.log(`[STATUS] Recipient ${recipientEmail} is OFFLINE. 'conversationUpdate' skipped.`);
         }
 
-        else if (action === "messageDelete") {
-            const { messageId, deletedBy } = data;
-            console.log("🗑️ Emitting messageDelete:", { chatId, messageId });
-            io.to(chatId).emit("messageDeleted", { chatId, messageId, deletedBy }); // ✅ unified event name
-        }
+    } else if (action === "messageReact") {
+        const { messageId, reactions } = data;
+        io.to(chatId).emit("messageReact", chatId, messageId, reactions);
+        console.log(`[SOCKET_EMIT] Emitted 'messageReact' to room: ${chatId}`);
 
-        else {
-            return res.status(400).send({ error: `Unknown action: ${action}` });
-        }
+    } else if (action === "messageEdit") {
+        const { messageId, newText } = data;
+        io.to(chatId).emit("messageEdit", chatId, messageId, newText);
+        console.log(`[SOCKET_EMIT] Emitted 'messageEdit' to room: ${chatId}`);
 
-        res.status(200).send({ success: true });
-    } catch (err) {
-        console.error("❌ Socket emit route error:", err.message);
-        res.status(500).send({ error: err.message });
+    } else if (action === "messageDelete") {
+        const { messageId, deletedBy } = data;
+        io.to(chatId).emit("messageDelete", chatId, messageId, deletedBy);
+        console.log(`[SOCKET_EMIT] Emitted 'messageDelete' to room: ${chatId}`);
+    } else {
+        console.error(`[API_ERROR] Unknown action received: ${action}`);
+        return res.status(400).send({ error: `Unknown action: ${action}` });
     }
+
+    return res.status(200).send({ success: true });
 });
 
+// -----------------------------------------------------
+// Socket.IO Connection Handlers
+// -----------------------------------------------------
+
 io.on("connection", (socket) => {
+    console.log(`[CONNECT] A user connected. Socket ID: ${socket.id}`);
+
     socket.on("userOnline", (email) => {
         if (!email) return;
         onlineUsers[email] = socket.id;
+        console.log(`[ONLINE] User online: ${email}. Total online: ${Object.keys(onlineUsers).length}`);
         io.emit("onlineUsersUpdate", Object.keys(onlineUsers));
     });
 
@@ -139,6 +155,7 @@ io.on("connection", (socket) => {
         const offlineEmail = Object.keys(onlineUsers).find(key => onlineUsers[key] === socket.id);
         if (offlineEmail) {
             delete onlineUsers[offlineEmail];
+            console.log(`[DISCONNECT] User offline: ${offlineEmail}. Total online: ${Object.keys(onlineUsers).length}`);
             io.emit("onlineUsersUpdate", Object.keys(onlineUsers));
         }
     });
@@ -146,16 +163,20 @@ io.on("connection", (socket) => {
     socket.on("joinChat", (chatId) => {
         if (!chatId) return;
         socket.join(chatId);
+        console.log(`[ROOM] Socket ${socket.id} joined chat: ${chatId}`);
     });
 
     socket.on("leaveChat", (chatId) => {
         if (!chatId) return;
         socket.leave(chatId);
+        console.log(`[ROOM] Socket ${socket.id} left chat: ${chatId}`);
     });
 
+    // Typing works, so we just confirm its success
     socket.on("typing", (chatId, senderEmail) => {
         if (!chatId || !senderEmail) return;
         socket.to(chatId).emit("typing", chatId, senderEmail);
+        console.log(`[EMIT_TYPING] ${senderEmail} is typing in ${chatId}`);
     });
 
     socket.on("stopTyping", (chatId, senderEmail) => {
@@ -166,12 +187,14 @@ io.on("connection", (socket) => {
     socket.on("messageSeen", (chatId, messageId, viewerEmail) => {
         if (!chatId || !messageId || !viewerEmail) return;
         io.to(chatId).emit("messageSeenUpdate", chatId, messageId, viewerEmail);
+        console.log(`[SOCKET_EMIT] 'messageSeenUpdate' in ${chatId} by ${viewerEmail}`);
     });
 
     socket.on("conversationSeen", async (chatId, viewerEmail) => {
         if (!chatId || !viewerEmail) return;
 
         socket.to(chatId).emit("conversationSeen", chatId, viewerEmail);
+        console.log(`[SOCKET_EMIT] 'conversationSeen' in ${chatId} by ${viewerEmail}`);
 
         try {
             const chatsCollection = await dbConnect("chats");
@@ -180,6 +203,7 @@ io.on("connection", (socket) => {
                 { $set: { "participants.$[viewer].unreadCount": 0 } },
                 { arrayFilters: [{ "viewer.email": viewerEmail }] }
             );
+            console.log(`[DB] Reset unread count for viewer: ${viewerEmail}`);
 
         } catch (err) {
             console.error("[DB_ERROR] Failed to reset unreadCount on conversationSeen:", err.message);
@@ -187,10 +211,8 @@ io.on("connection", (socket) => {
     });
 });
 
-server.listen(PORT, "0.0.0.0", () =>
-    console.log(`✅ Socket server running on port ${PORT}`)
-);
+server.listen(PORT, () => console.log(`✅ Socket server running on port ${PORT}`));
 
 app.get("/", (req, res) => {
-    res.send(`✅ Socket server is running and listening on port ${PORT}.`);
+    res.send("✅ Socket server is running and listening on the correct port.");
 });
