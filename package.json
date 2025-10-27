@@ -2,10 +2,10 @@
   "name": "socket-server",
   "version": "1.0.0",
   "type": "module",
-  "main": "server.js",
+  "main": "socket.js",
   "scripts": {
-    "start": "node server.js",
-    "dev": "node server.js"
+    "start": "node socket.js",
+    "dev": "node socket.js"
   },
   "dependencies": {
     "ably": "^2.14.0",
